@@ -30,4 +30,4 @@ jobs:
       - name: Install PlatformIO Core
         run: pip install --upgrade platformio
       - name: Lint PlatformIO Project
-        run: pio check
+        run: pio check --fail-on-defect=high
