@@ -126,3 +126,18 @@ void setup() {
 void loop() {
   server.handleClient();
 }
+
+// #include <Arduino.h>
+
+// #define LED_PIN 4   // Flash LED on ESP32-CAM
+
+// void setup() {
+//     pinMode(LED_PIN, OUTPUT);
+// }
+
+// void loop() {
+//     digitalWrite(LED_PIN, HIGH);  // ON
+//     delay(500);
+//     digitalWrite(LED_PIN, LOW);   // OFF
+//     delay(500);
+// }
