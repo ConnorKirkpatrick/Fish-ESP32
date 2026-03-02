@@ -23,6 +23,7 @@ bool lightOn = false;
 #include "esp_camera.h"
 #include <WiFi.h>
 #include <WebServer.h>
+#include <ArduinoOTA.h>
 
 const char* ssid = "SKY67NSU";
 const char* password = "IUnDef45tEWU";
@@ -72,6 +73,27 @@ void setup() {
   int endTime = millis();
   Serial.printf("Serial init time: %d ms\n", endTime - startTime);
   Serial.println("ESP32-CAM BOOTED");
+
+  ArduinoOTA.setHostname("esp32cam");
+
+  ArduinoOTA.onStart([]() {
+    Serial.println("Start OTA");
+  });
+
+  ArduinoOTA.onEnd([]() {
+    Serial.println("\nEnd OTA");
+  });
+
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    Serial.printf("Progress: %u%%\r", (progress * 100) / total);
+  });
+
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("Error[%u]\n", error);
+  });
+
+  ArduinoOTA.begin();
+Serial.println("OTA Ready");
 
 
   camera_config_t config;
@@ -124,6 +146,7 @@ void setup() {
 }
 
 void loop() {
+  ArduinoOTA.handle();
   server.handleClient();
 }
 
