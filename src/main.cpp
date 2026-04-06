@@ -1,3 +1,10 @@
+#include <Arduino.h>
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <ArduinoOTA.h>
+#include <ESPmDNS.h>
 
 #define PWDN_GPIO_NUM     32
 #define RESET_GPIO_NUM    -1
@@ -17,84 +24,104 @@
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
 #define LIGHT_GPIO_NUM     4
-bool lightOn = false;
 
-#include <Arduino.h>
-#include "esp_camera.h"
-#include <WiFi.h>
-#include <WebServer.h>
-#include <ArduinoOTA.h>
 
 const char* ssid = "SKY67NSU";
 const char* password = "IUnDef45tEWU";
 
-WebServer server(80);
+AsyncWebServer server(80);
 
-void handle_jpg_stream() {
-  WiFiClient client = server.client();
+void handle_jpg_stream(AsyncWebServerRequest *request) {
 
-  String response = "HTTP/1.1 200 OK\r\n";
-  response += "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
-  server.sendContent(response);
+  AsyncWebServerResponse *response = request->beginChunkedResponse(
+    "multipart/x-mixed-replace; boundary=frame",
+    [](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
 
-  while (client.connected()) {
-    camera_fb_t * fb = esp_camera_fb_get();
-    if (!fb) {
-      Serial.println("Camera capture failed");
-      return;
+      camera_fb_t *fb = esp_camera_fb_get();
+      if (!fb) {
+        return 0;
+      }
+
+      size_t len = 0;
+
+      // Boundary + headers
+      len += snprintf((char *)buffer, maxLen,
+        "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",
+        fb->len);
+
+      // Copy image data if space allows
+      if (len + fb->len < maxLen) {
+        memcpy(buffer + len, fb->buf, fb->len);
+        len += fb->len;
+        len += snprintf((char *)buffer + len, maxLen - len, "\r\n");
+      }
+
+      esp_camera_fb_return(fb);
+      return len;
     }
+  );
 
-    server.sendContent("--frame\r\n");
-    server.sendContent("Content-Type: image/jpeg\r\n\r\n");
-    server.sendContent((const char*)fb->buf, fb->len);
-    server.sendContent("\r\n");
+  response->addHeader("Cache-Control", "no-cache");
+  response->addHeader("Pragma", "no-cache");
 
-    esp_camera_fb_return(fb);
-    delay(30);
-  }
+  request->send(response);
+}
+#define LIGHT_GPIO_NUM 4
+
+void setupRoutes() {
+
+  // Root page
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send(200, "text/html",
+      "<h1>ESP32-CAM</h1>"
+      "<p><a href='/stream'>View Stream</a></p>"
+      "<p><a href='/light/on'>Light ON</a></p>"
+      "<p><a href='/light/off'>Light OFF</a></p>"
+      "<p>OTA via Arduino IDE</p>"
+    );
+  });
+
+  server.on("/light/on", HTTP_GET, [](AsyncWebServerRequest *request){
+    digitalWrite(LIGHT_GPIO_NUM, HIGH);
+    request->send(200, "text/plain", "Light ON");
+  });
+
+  server.on("/light/off", HTTP_GET, [](AsyncWebServerRequest *request){
+    digitalWrite(LIGHT_GPIO_NUM, LOW);
+    request->send(200, "text/plain", "Light OFF");
+  });
 }
 
-void handle_light_on() {
-  digitalWrite(LIGHT_GPIO_NUM, HIGH);
-  server.send(200, "text/plain", "Light turned ON");
-}
 
-void handle_light_off() {
-  digitalWrite(LIGHT_GPIO_NUM, LOW);
-  server.send(200, "text/plain", "Light turned OFF");
-}
-
-void setup() {
-  int startTime = millis();
-  if (!Serial) {
-    delay(1);
-  }
-  Serial.begin(115200);
-  int endTime = millis();
-  Serial.printf("Serial init time: %d ms\n", endTime - startTime);
-  Serial.println("ESP32-CAM BOOTED");
+void setupOTA() {
 
   ArduinoOTA.setHostname("esp32cam");
 
-  ArduinoOTA.onStart([]() {
-    Serial.println("Start OTA");
-  });
-
-  ArduinoOTA.onEnd([]() {
-    Serial.println("\nEnd OTA");
-  });
-
-  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-    Serial.printf("Progress: %u%%\r", (progress * 100) / total);
-  });
-
-  ArduinoOTA.onError([](ota_error_t error) {
-    Serial.printf("Error[%u]\n", error);
-  });
+  ArduinoOTA
+    .onStart([]() {
+      Serial.println("OTA Start");
+    })
+    .onEnd([]() {
+      Serial.println("\nOTA End");
+    })
+    .onProgress([](unsigned int progress, unsigned int total) {
+      Serial.printf("Progress: %u%%\r", (progress * 100) / total);
+    })
+    .onError([](ota_error_t error) {
+      Serial.printf("Error[%u]: ", error);
+    });
 
   ArduinoOTA.begin();
-Serial.println("OTA Ready");
 
+  Serial.println("OTA Ready");
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("ESP32-CAM Booting...");
+
+  pinMode(LIGHT_GPIO_NUM, OUTPUT);
+  digitalWrite(LIGHT_GPIO_NUM, LOW);
 
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -117,18 +144,24 @@ Serial.println("OTA Ready");
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
-
   config.frame_size = FRAMESIZE_VGA;
-  config.jpeg_quality = 12;
-  config.fb_count = 2;
+  config.jpeg_quality = 15;
+  config.fb_count = 3;
 
   if (esp_camera_init(&config) != ESP_OK) {
     Serial.println("Camera init failed");
     return;
   }
 
-  pinMode(LIGHT_GPIO_NUM, OUTPUT);
-  digitalWrite(LIGHT_GPIO_NUM, LOW);
+  IPAddress local_IP(192, 168, 1, 184);     // choose an unused IP
+  IPAddress gateway(192, 168, 1, 1);        // your router
+  IPAddress subnet(255, 255, 255, 0);
+  IPAddress primaryDNS(8, 8, 8, 8);
+  IPAddress secondaryDNS(8, 8, 4, 4);
+
+  if (!WiFi.config(local_IP, gateway, subnet, primaryDNS, secondaryDNS)) {
+  Serial.println("Static IP failed to configure");
+}
 
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED) {
@@ -136,31 +169,25 @@ Serial.println("OTA Ready");
     Serial.print(".");
   }
 
-  Serial.println("\nWiFi connected");
-  Serial.println(WiFi.localIP());
+  WiFi.setSleep(false);
+  Serial.println("\nWiFi connected: " + WiFi.localIP().toString());
 
-  server.on("/stream", HTTP_GET, handle_jpg_stream);
-  server.on("/light/on", HTTP_GET, handle_light_on);
-  server.on("/light/off", HTTP_GET, handle_light_off);
+  if (!MDNS.begin("esp32cam")) {
+    Serial.println("Error starting mDNS");
+  } else {
+    Serial.println("mDNS started: http://esp32cam.local");
+  }
+
+  // Routes
+  //setupRoutes();
+  //server.on("/stream", HTTP_GET, handle_jpg_stream);
+
+  setupOTA();
+
   server.begin();
+  Serial.println("Server Ready");
 }
 
 void loop() {
   ArduinoOTA.handle();
-  server.handleClient();
 }
-
-// #include <Arduino.h>
-
-// #define LED_PIN 4   // Flash LED on ESP32-CAM
-
-// void setup() {
-//     pinMode(LED_PIN, OUTPUT);
-// }
-
-// void loop() {
-//     digitalWrite(LED_PIN, HIGH);  // ON
-//     delay(500);
-//     digitalWrite(LED_PIN, LOW);   // OFF
-//     delay(500);
-// }
