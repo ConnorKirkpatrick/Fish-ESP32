@@ -3,8 +3,12 @@
 #include <WiFi.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
-#include <ArduinoOTA.h>
+#include <ElegantOTA.h>
 #include <ESPmDNS.h>
+
+bool streamEnabled = false;
+unsigned long streamEnableTime = 0;
+#define STREAM_DELAY_MS 180000 // 3 minutes
 
 #define PWDN_GPIO_NUM     32
 #define RESET_GPIO_NUM    -1
@@ -25,59 +29,71 @@
 #define PCLK_GPIO_NUM     22
 #define LIGHT_GPIO_NUM     4
 
-
 const char* ssid = "SKY67NSU";
 const char* password = "IUnDef45tEWU";
 
 AsyncWebServer server(80);
+WiFiServer streamServer(81);
 
-void handle_jpg_stream(AsyncWebServerRequest *request) {
+void otaTask(void *pvParameters) {
+  for (;;) {
+    ElegantOTA.loop();
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+  }
+}
+void streamTask(void *pvParameters) {
+  WiFiClient client = *((WiFiClient*)pvParameters);
+  delete (WiFiClient*)pvParameters;
 
-  AsyncWebServerResponse *response = request->beginChunkedResponse(
-    "multipart/x-mixed-replace; boundary=frame",
-    [](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
-
-      camera_fb_t *fb = esp_camera_fb_get();
-      if (!fb) {
-        return 0;
-      }
-
-      size_t len = 0;
-
-      // Boundary + headers
-      len += snprintf((char *)buffer, maxLen,
-        "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",
-        fb->len);
-
-      // Copy image data if space allows
-      if (len + fb->len < maxLen) {
-        memcpy(buffer + len, fb->buf, fb->len);
-        len += fb->len;
-        len += snprintf((char *)buffer + len, maxLen - len, "\r\n");
-      }
-
-      esp_camera_fb_return(fb);
-      return len;
-    }
+  client.print(
+    "HTTP/1.1 200 OK\r\n"
+    "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n"
+    "Cache-Control: no-cache\r\n"
+    "Connection: close\r\n"
+    "\r\n"
   );
 
-  response->addHeader("Cache-Control", "no-cache");
-  response->addHeader("Pragma", "no-cache");
+  while (client.connected()) {
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) {
+      vTaskDelay(100 / portTICK_PERIOD_MS);
+      continue;
+    }
 
-  request->send(response);
+    client.printf(
+      "--frame\r\n"
+      "Content-Type: image/jpeg\r\n"
+      "Content-Length: %u\r\n"
+      "\r\n",
+      fb->len
+    );
+
+    size_t sent = 0;
+    while (sent < fb->len) {
+      size_t toSend = min((size_t)1024, fb->len - sent);
+      client.write(fb->buf + sent, toSend);
+      sent += toSend;
+      vTaskDelay(1);
+    }
+
+    client.print("\r\n");
+    esp_camera_fb_return(fb);
+    vTaskDelay(50 / portTICK_PERIOD_MS);
+  }
+
+  client.stop();
+  vTaskDelete(NULL);
 }
-#define LIGHT_GPIO_NUM 4
 
 void setupRoutes() {
-
-  // Root page
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
     request->send(200, "text/html",
       "<h1>ESP32-CAM</h1>"
-      "<p><a href='/stream'>View Stream</a></p>"
+      "<p><a href='http://192.168.1.184:81'>View Stream</a></p>"
       "<p><a href='/light/on'>Light ON</a></p>"
       "<p><a href='/light/off'>Light OFF</a></p>"
-      "<p>OTA via Arduino IDE</p>"
+      "<p><a href='/update'>OTA Update</a></p>"
+      "<p><a href='/restart'>Restart ESP32</a></p>"
     );
   });
 
@@ -90,36 +106,19 @@ void setupRoutes() {
     digitalWrite(LIGHT_GPIO_NUM, LOW);
     request->send(200, "text/plain", "Light OFF");
   });
-}
 
-
-void setupOTA() {
-
-  ArduinoOTA.setHostname("esp32cam");
-
-  ArduinoOTA
-    .onStart([]() {
-      Serial.println("OTA Start");
-    })
-    .onEnd([]() {
-      Serial.println("\nOTA End");
-    })
-    .onProgress([](unsigned int progress, unsigned int total) {
-      Serial.printf("Progress: %u%%\r", (progress * 100) / total);
-    })
-    .onError([](ota_error_t error) {
-      Serial.printf("Error[%u]: ", error);
-    });
-
-  ArduinoOTA.begin();
-
-  Serial.println("OTA Ready");
+    server.on("/restart", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send(200, "text/plain", "Restarting... OTA window open for 3 minutes at http://192.168.1.184/update");
+    delay(500);
+    ESP.restart();
+  });
 }
 
 void setup() {
   Serial.begin(115200);
   Serial.println("ESP32-CAM Booting...");
 
+  delay(500);
   pinMode(LIGHT_GPIO_NUM, OUTPUT);
   digitalWrite(LIGHT_GPIO_NUM, LOW);
 
@@ -144,24 +143,24 @@ void setup() {
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
-  config.frame_size = FRAMESIZE_VGA;
-  config.jpeg_quality = 15;
-  config.fb_count = 3;
+  config.frame_size = FRAMESIZE_QVGA;
+  config.jpeg_quality = 10;
+  config.fb_count = 2;
 
   if (esp_camera_init(&config) != ESP_OK) {
     Serial.println("Camera init failed");
     return;
   }
 
-  IPAddress local_IP(192, 168, 1, 184);     // choose an unused IP
-  IPAddress gateway(192, 168, 1, 1);        // your router
+  IPAddress local_IP(192, 168, 1, 184);
+  IPAddress gateway(192, 168, 1, 1);
   IPAddress subnet(255, 255, 255, 0);
   IPAddress primaryDNS(8, 8, 8, 8);
   IPAddress secondaryDNS(8, 8, 4, 4);
 
   if (!WiFi.config(local_IP, gateway, subnet, primaryDNS, secondaryDNS)) {
-  Serial.println("Static IP failed to configure");
-}
+    Serial.println("Static IP failed to configure");
+  }
 
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED) {
@@ -178,16 +177,45 @@ void setup() {
     Serial.println("mDNS started: http://esp32cam.local");
   }
 
-  // Routes
-  //setupRoutes();
-  //server.on("/stream", HTTP_GET, handle_jpg_stream);
-
-  setupOTA();
-
+  setupRoutes();
+  ElegantOTA.begin(&server);
+  xTaskCreatePinnedToCore(
+  otaTask,
+  "ota",
+  8192,
+  NULL,
+  1,
+  NULL,
+  0  // core 0
+);
   server.begin();
+  streamServer.begin();
+  streamEnableTime = millis() + STREAM_DELAY_MS;
+  Serial.println("Stream paused for 3 minutes to allow OTA...");
+  Serial.println("Stream at http://192.168.1.184:81/");
+  Serial.println("OTA at http://192.168.1.184/update");
   Serial.println("Server Ready");
 }
 
 void loop() {
-  ArduinoOTA.handle();
+  if (!streamEnabled && millis() > streamEnableTime) {
+    streamEnabled = true;
+    Serial.println("Stream enabled");
+  }
+
+  if (streamEnabled) {
+    WiFiClient client = streamServer.accept();
+    if (client) {
+      WiFiClient *clientPtr = new WiFiClient(client);
+      xTaskCreatePinnedToCore(
+        streamTask,
+        "stream",
+        8192,
+        clientPtr,
+        1,
+        NULL,
+        1
+      );
+    }
+  }
 }
